@@ -2,6 +2,7 @@ import os
 import io
 import logging
 import requests
+import mimetypes
 
 from typing import List, Dict, Optional
 from PIL import Image
@@ -11,7 +12,7 @@ from label_studio_ml.response import ModelResponse
 
 logger = logging.getLogger(__name__)
 
-HUGGINGFACE_API_BASE = "https://api-inference.huggingface.co/models"
+HUGGINGFACE_API_BASE = "https://router.huggingface.co/hf-inference/models"
 
 
 class HuggingFaceAnnotationModel(LabelStudioMLBase):
@@ -55,7 +56,7 @@ class HuggingFaceAnnotationModel(LabelStudioMLBase):
             return None
         return {"Authorization": f"Bearer {api_key}"}
 
-    def _call_hf_api(self, *, json_data=None, binary_data=None):
+    def _call_hf_api(self, *, json_data=None, binary_data=None, mime_type="application/octet-stream"):
         """
         Call the Hugging Face Inference API.
         Provide either json_data (dict) for text tasks or binary_data (bytes) for image tasks.
@@ -71,9 +72,15 @@ class HuggingFaceAnnotationModel(LabelStudioMLBase):
 
         try:
             if binary_data is not None:
-                response = requests.post(url, headers=headers, data=binary_data, timeout=30)
+                # Add content type header strictly required by router.huggingface.co
+                headers["Content-Type"] = mime_type
+                response = requests.post(url, headers=headers, data=binary_data, timeout=60)
+            elif json_data is not None:
+                # Automatically sets 'Content-Type: application/json'
+                response = requests.post(url, headers=headers, json=json_data, timeout=60)
             else:
-                response = requests.post(url, headers=headers, json=json_data, timeout=30)
+                logger.error("Both json_data and binary_data are None. Cannot call Hugging Face API.")
+                return None
 
             response.raise_for_status()
             return response.json()
@@ -152,25 +159,56 @@ class HuggingFaceAnnotationModel(LabelStudioMLBase):
             logger.warning(f"Task {task.get('id')}: no image found at data['{value_key}']")
             return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
 
+        # Check local path validity
         image_path = self.get_local_path(image_url, task_id=task.get("id"))
+        if not image_path or not os.path.exists(image_path):
+            logger.error(f"Task {task.get('id')}: Image path is invalid or does not exist: {image_path}")
+            return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
+
         with open(image_path, "rb") as f:
             image_bytes = f.read()
+
+        # Check bytes payload
+        if not image_bytes:
+            logger.error(f"Task {task.get('id')}: Read 0 bytes from {image_path}")
+            return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
 
         img = Image.open(io.BytesIO(image_bytes))
         img_width, img_height = img.size
 
-        hf_response = self._call_hf_api(binary_data=image_bytes)
+        # Detect the correct MIME type
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type:
+            mime_type = "image/jpeg"  # Safe fallback
+
+        # Pass payload safely with the correct content type
+        hf_response = self._call_hf_api(binary_data=image_bytes, mime_type=mime_type)
         if not isinstance(hf_response, list):
             logger.warning(f"Task {task.get('id')}: unexpected object detection response: {hf_response}")
             return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
+
+        # Collect all unique labels from HF response to build a mapping
+        hf_labels = list({item.get("label") for item in hf_response if item.get("label")})
+        # Map HF labels to Label Studio config labels (case-insensitively, etc.)
+        label_map = self.build_label_map(from_name, hf_labels)
+        
+        logger.debug(f"HF Labels: {hf_labels}")
+        logger.debug(f"Mapped Labels: {label_map}")
 
         results = []
         scores = []
         for item in hf_response:
             box = item.get("box")
-            label = item.get("label")
+            raw_label = item.get("label")
             score = item.get("score", 0.0)
-            if not box or not label:
+            
+            if not box or not raw_label:
+                continue
+
+            # Map the raw label to the exact label expected by Label Studio
+            mapped_label = label_map.get(raw_label)
+            if not mapped_label:
+                logger.debug(f"Skipping prediction with unmapped label: {raw_label}")
                 continue
 
             results.append({
@@ -182,7 +220,7 @@ class HuggingFaceAnnotationModel(LabelStudioMLBase):
                     "y": box["ymin"] * 100 / img_height,
                     "width": (box["xmax"] - box["xmin"]) * 100 / img_width,
                     "height": (box["ymax"] - box["ymin"]) * 100 / img_height,
-                    "rectanglelabels": [label],
+                    "rectanglelabels": [mapped_label],
                 },
                 "score": score,
             })
@@ -205,15 +243,22 @@ class HuggingFaceAnnotationModel(LabelStudioMLBase):
             logger.warning(f"Task {task.get('id')}: unexpected NER response: {hf_response}")
             return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
 
+        hf_labels = list({(item.get("entity_group") or item.get("entity")) for item in hf_response if (item.get("entity_group") or item.get("entity"))})
+        label_map = self.build_label_map(from_name, hf_labels)
+
         results = []
         scores = []
         for item in hf_response:
-            label = item.get("entity_group") or item.get("entity")
+            raw_label = item.get("entity_group") or item.get("entity")
             start = item.get("start")
             end = item.get("end")
             score = item.get("score", 0.0)
 
-            if label is None or start is None or end is None:
+            if raw_label is None or start is None or end is None:
+                continue
+
+            mapped_label = label_map.get(raw_label)
+            if not mapped_label:
                 continue
 
             results.append({
@@ -224,7 +269,7 @@ class HuggingFaceAnnotationModel(LabelStudioMLBase):
                     "start": start,
                     "end": end,
                     "text": text[start:end],
-                    "labels": [label],
+                    "labels": [mapped_label],
                 },
                 "score": score,
             })
@@ -252,19 +297,30 @@ class HuggingFaceAnnotationModel(LabelStudioMLBase):
             logger.warning(f"Task {task.get('id')}: unexpected classification response: {hf_response}")
             return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
 
-        # Pick the highest-confidence label
-        best = max(hf_response, key=lambda x: x.get("score", 0.0))
-        label = best.get("label", "")
-        score = best.get("score", 0.0)
+        hf_labels = list({item.get("label") for item in hf_response if item.get("label")})
+        label_map = self.build_label_map(from_name, hf_labels)
+
+        # Pick the highest-confidence label that we can map
+        mapped_results = []
+        for item in hf_response:
+            raw_label = item.get("label", "")
+            mapped_label = label_map.get(raw_label)
+            if mapped_label:
+                mapped_results.append((mapped_label, item.get("score", 0.0)))
+
+        if not mapped_results:
+            return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
+
+        best_label, best_score = max(mapped_results, key=lambda x: x[1])
 
         return {
             "result": [{
                 "from_name": from_name,
                 "to_name": to_name,
                 "type": "choices",
-                "value": {"choices": [label]},
+                "value": {"choices": [best_label]},
             }],
-            "score": score,
+            "score": best_score,
             "model_version": self.get("model_version"),
         }
 
@@ -278,27 +334,45 @@ class HuggingFaceAnnotationModel(LabelStudioMLBase):
             return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
 
         image_path = self.get_local_path(image_url, task_id=task.get("id"))
+        if not image_path or not os.path.exists(image_path):
+            return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
+
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
-        hf_response = self._call_hf_api(binary_data=image_bytes)
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type:
+            mime_type = "image/jpeg"
+
+        hf_response = self._call_hf_api(binary_data=image_bytes, mime_type=mime_type)
 
         # HF image classification returns [{label, score}, ...]
         if not isinstance(hf_response, list) or not hf_response:
             logger.warning(f"Task {task.get('id')}: unexpected image classification response: {hf_response}")
             return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
 
-        best = max(hf_response, key=lambda x: x.get("score", 0.0))
-        label = best.get("label", "")
-        score = best.get("score", 0.0)
+        hf_labels = list({item.get("label") for item in hf_response if item.get("label")})
+        label_map = self.build_label_map(from_name, hf_labels)
+
+        mapped_results = []
+        for item in hf_response:
+            raw_label = item.get("label", "")
+            mapped_label = label_map.get(raw_label)
+            if mapped_label:
+                mapped_results.append((mapped_label, item.get("score", 0.0)))
+
+        if not mapped_results:
+            return {"result": [], "score": 0.0, "model_version": self.get("model_version")}
+
+        best_label, best_score = max(mapped_results, key=lambda x: x[1])
 
         return {
             "result": [{
                 "from_name": from_name,
                 "to_name": to_name,
                 "type": "choices",
-                "value": {"choices": [label]},
+                "value": {"choices": [best_label]},
             }],
-            "score": score,
+            "score": best_score,
             "model_version": self.get("model_version"),
         }
