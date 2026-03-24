@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  ml-backend:
+    container_name: huggingface_annotation
+    build:
+      # Build from the repo root so Docker can access the local label_studio_ml package
+      context: ../../../
+      dockerfile: label_studio_ml/examples/huggingface_annotation/Dockerfile
+    init: true
+    environment:
+      # ── Required ──────────────────────────────────────────────────────────────
+      - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY}
+      - MODEL_NAME=${MODEL_NAME}
+      # ── Label Studio connection ────────────────────────────────────────────────
+      - LABEL_STUDIO_URL=${LABEL_STUDIO_URL:-http://localhost:8080}
+      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY}
+      # ── Optional tuning ───────────────────────────────────────────────────────
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - WORKERS=${WORKERS:-1}
+      - THREADS=${THREADS:-8}
+      - MODEL_DIR=/data/models
+      # ── Optional basic auth ────────────────────────────────────────────────────
+      - BASIC_AUTH_USER=${BASIC_AUTH_USER:-}
+      - BASIC_AUTH_PASS=${BASIC_AUTH_PASS:-}
+    ports:
+      - "${PORT:-9090}:9090"
+    volumes:
+      - "./data/server:/data"
+      - "./data/.cache:/root/.cache"

@@ -1,0 +1,4 @@
+requests
+Pillow
+gunicorn
+python-dotenv
